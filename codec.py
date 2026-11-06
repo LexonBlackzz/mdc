@@ -178,9 +178,14 @@ HIT = float(os.environ.get('HIT', 1.2))  # a segment costing more than HIT x the
 MOFF = float(os.environ.get('MOFF', 12))  # masking margin (dB below the spread band power) used when choosing allocation
 
 
+GLB = 0  # bass-dominated files (808s, sub basses): bands centred below this bin keep the low gamma GLOW while everything above uses a high one (header flag bit 7)
+GLOW, GHI, BASSFRAC = 0.3, 0.7, 0.97  # BASSFRAC: share of the file's energy below ~500 Hz that triggers it
+
+
 def band_steps(L, step, gamma, fn=None):  # quantizer step per band
     r = rhat(L)
     s = step * r ** gamma
+    if GLB > 0: s = np.where((EDGES[:-1] + EDGES[1:]) // 2 < GLB, step * r ** GLOW, s)
     if fn is not None: s = s * fn  # frame factor: loudness-following steps (TG) and the per-segment allocation offsets
     if KAP > 0: s = np.minimum(s, KAP * r)
     return np.where(L > 0, s, 1.0).astype(F32)
@@ -391,7 +396,7 @@ def pack(coef, L, side, tb, rate, n, step, tilt, nf, zmin=None, seeds=True, segf
     enc = rc.encode_mix if mix else rc.encode
     while (m := enc(q, K, out, bc, BMAP)) < 0: out = np.empty(len(out) * 2, np.uint8)
     bits = np.unpackbits(best[use].astype(np.uint8)[:, None], axis=1)[:, 8 - SB:].reshape(-1) if seeds else np.zeros(SB * int(use.sum()), np.uint8)
-    return struct.pack(HDR, rate, n, coef.shape[0], step, tilt, int(MS and coef.shape[0] == 2) | (int(ENVC) << 1) | (EDGE_CUSTOM << 2) | (int(segf is not None and bool(tb)) << 3) | (int(mix) << 4) | (int(TNS_USED and bool(tb)) << 5) | (int(DUP and bool(tb)) << 6), K, gamma, nf, len(side), kap, zmin, m, tg) + tb2 + side + env + out[:m].tobytes() + np.packbits(bits).tobytes()
+    return struct.pack(HDR, rate, n, coef.shape[0], step, tilt, int(MS and coef.shape[0] == 2) | (int(ENVC) << 1) | (EDGE_CUSTOM << 2) | (int(segf is not None and bool(tb)) << 3) | (int(mix) << 4) | (int(TNS_USED and bool(tb)) << 5) | (int(DUP and bool(tb)) << 6) | (int(GLB > 0 and bool(tb)) << 7), K, gamma, nf, len(side), kap, zmin, m, tg) + tb2 + side + env + out[:m].tobytes() + np.packbits(bits).tobytes()
 
 
 def auto_cutoff(kbps):
@@ -614,6 +619,10 @@ def encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0, scope=False, mon
     saved = GAMMA, MS, NF, SCOPE, ENVC
     ENVC = kbps < 8 and not scope
     GAMMA = float(np.interp(kbps, [16, 32], [GLO, GAMMA]))  # low rates: spread the noise more evenly across bands so quiet highs (fast arps) survive
+    global GLB; GLB = 0
+    if kbps >= 32 and not scope:  # nearly all energy in the bass: keep the bass tight (no noise floor around the notes), spend the rest more evenly
+        e = np.abs(np.fft.rfft(x.astype(np.float64).mean(1))) ** 2; GLB = int(24 * N // 1024) * int(e[:int(500 * len(x) / rate)].sum() >= BASSFRAC * e.sum() > 0)
+        if GLB: GAMMA = GHI
     if scope: GAMMA, MS, NF, SCOPE = 0.0, False, 0.0, True
     global KAP, TG, FIXED, DUP
     FIXED = step; DUP = dup
@@ -624,7 +633,7 @@ def encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0, scope=False, mon
             KAP = kap; b = _encode_kbps(x, rate, kbps, show, tilt, cutoff)
             if step or len(b) * 8 / dur / 1000 <= kbps * 1.02: break
         return b
-    finally: GAMMA, MS, NF, SCOPE, ENVC = saved; KAP = 0
+    finally: GAMMA, MS, NF, SCOPE, ENVC = saved; KAP = 0; GLB = 0
 
 
 GLO = float(os.environ.get('GLO', 0.45))  # gamma at 16 kbps and below
@@ -701,8 +710,9 @@ def _encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0):
 
 
 def decode(b, show=False):
-    rate, n, ch, step, tilt, ms, K, gamma, nf, sl, kap, zmin, cl, tg = struct.unpack(HDR, b[:HLEN]); mixed = (ms >> 4) & 1; tnsflag = (ms >> 5) & 1; dupflag = (ms >> 6) & 1; envc, cust, segflag, ms = (ms >> 1) & 1, (ms >> 2) & 1, (ms >> 3) & 1, ms & 1
-    global KAP, TG; KAP, TG = kap, tg; nflo = 1.0  # header slot formerly the unused NFLO: the step cap
+    global KAP, TG, GLB
+    rate, n, ch, step, tilt, ms, K, gamma, nf, sl, kap, zmin, cl, tg = struct.unpack(HDR, b[:HLEN]); mixed = (ms >> 4) & 1; tnsflag = (ms >> 5) & 1; dupflag = (ms >> 6) & 1; GLB = int(24 * N // 1024) * ((ms >> 7) & 1); envc, cust, segflag, ms = (ms >> 1) & 1, (ms >> 2) & 1, (ms >> 3) & 1, ms & 1
+    KAP, TG = kap, tg; nflo = 1.0  # header slot formerly the unused NFLO: the step cap
     F, wts = nframes(n), weights(tilt); tl = (F + 7) // 8
     short = np.unpackbits(np.frombuffer(b, np.uint8, count=tl, offset=HLEN))[:F].astype(bool); var = varof(short)
     if cust: ni = b[HLEN + tl]; set_edges(np.r_[0, np.frombuffer(b, np.uint8, count=ni, offset=HLEN + tl + 1).astype(int) * (N // 256), N]); tl += 1 + ni
