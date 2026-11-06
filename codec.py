@@ -492,7 +492,8 @@ def choose_angles(lr, g):
 
 
 TNSON = int(os.environ.get('TNS', 1))  # temporal noise shaping on long frames: a short LPC filter across frequency flattens the frame's time envelope before quantising; the decoder undoes it, so quantisation noise and noise fill follow the envelope (sharp hits, no smear)
-TNSG = float(os.environ.get('TNSG', 1.25))  # prediction gain a frame needs before the filter is used
+TNSG = float(os.environ.get('TNSG', 1.25))
+TNSS = float(os.environ.get('TNSS', 1e-2))  # the filtered range must hold at least this share of the frame's energy (-20 dB): on a bass note TNS would turn the quantization error into bursts  # prediction gain a frame needs before the filter is used
 TORD = 8
 TNS_USED = 0
 
@@ -502,7 +503,7 @@ def tns_range(rate):  # bins the filter covers: ~1.5 kHz .. 16 kHz
 
 
 @njit(cache=True)
-def _tns_enc(coef, short, bs, be, thr, idx, on):
+def _tns_enc(coef, short, bs, be, thr, share, idx, on):
     ch, F, _ = coef.shape; n = be - bs
     r = np.zeros(TORD + 1); a = np.zeros(TORD + 1); tmp = np.zeros(TORD + 1); kq = np.zeros(TORD + 1); x = np.zeros(n)
     for c in range(ch):
@@ -514,6 +515,9 @@ def _tns_enc(coef, short, bs, be, thr, idx, on):
                 for j in range(n - i): acc += x[j] * x[j + i]
                 r[i] = acc
             if r[0] < 1e-3: continue
+            tot = 0.0
+            for j in range(coef.shape[2]): tot += coef[c, f, j] * coef[c, f, j]
+            if r[0] < share * tot: continue  # the filtered range is nearly empty next to the rest of the frame (a bass note): its noise-shaped error would stick out
             # Levinson-Durbin -> reflection coefficients
             e = r[0]; a[:] = 0.0; a[0] = 1.0; kk = np.zeros(TORD + 1)
             for i in range(1, TORD + 1):
@@ -585,7 +589,7 @@ def prepare(x, rate, cutoff, show=False, g=0.0):
     TNS_USED = 0
     if TNSON and not SCOPE:
         ch, F, _ = coef.shape; idx = np.zeros((ch, F, TORD), np.int8); on = np.zeros((ch, F), bool); bs, be = tns_range(rate)
-        _tns_enc(coef, short, bs, be, TNSG, idx, on)
+        _tns_enc(coef, short, bs, be, TNSG, TNSS, idx, on)
         if on.any(): tb += tns_pack(idx, on); TNS_USED = 1
     return coef, levels(coef), tb
 
