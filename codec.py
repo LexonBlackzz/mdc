@@ -281,6 +281,7 @@ def _fold(deq, q, sh, edges, sgn, out, has):
 
 
 SDROP = float(os.environ.get('SDROP', 10))  # dB: below 24 kbps the side channel is dropped in bands where it is this far below the main channel (its sparse pulses make the stereo image flicker and cost bits the voice needs); 0 = never
+SNF = float(os.environ.get('SNF', 0.7))  # noise fill strength of the second (side) channel relative to the first
 NFSM = float(os.environ.get('NFSM', 0.5))
 NFIF = int(os.environ.get('NFIF', 1))
 _IW = None
@@ -306,7 +307,9 @@ def fill_amp(deq, q, L, sbin):  # (frames, N) noise amplitude per bin before str
         if _IW is None or _IW[0] != EDGES.tobytes(): _IW = (EDGES.tobytes(), _iw())
         ab = ab @ _IW[1].T  # ... and across frequency (linear between band centres instead of a staircase)
     else: ab = ab[..., BMAP]
-    return np.minimum(ab, F32(0.5) * sbin)
+    ab = np.minimum(ab, F32(0.5) * sbin)
+    if SNF != 1 and ab.shape[0] == 2: ab[1] *= F32(SNF)  # the side channel's independent noise is less welcome than the main channel's
+    return ab
 
 
 def fw(rate, nflo):  # noise weight: nflo below 500 Hz, smoothly up to 1 at 4 kHz
