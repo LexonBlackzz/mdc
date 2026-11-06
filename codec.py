@@ -280,6 +280,7 @@ def _fold(deq, q, sh, edges, sgn, out, has):
             if nz * 5 >= w: last = b
 
 
+SDROP = float(os.environ.get('SDROP', 10))  # dB: below 24 kbps the side channel is dropped in bands where it is this far below the main channel (its sparse pulses make the stereo image flicker and cost bits the voice needs); 0 = never
 NFSM = float(os.environ.get('NFSM', 0.5))
 NFIF = int(os.environ.get('NFIF', 1))
 _IW = None
@@ -650,6 +651,8 @@ def _encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0):
     def fix(coef, L):  # very low targets: drop the second channel; cheaper level coding
         if mono and coef.shape[0] == 2 and MS: coef[1] = 0; L[1] = 0  # side channel dropped: decodes as mono
         if not SCOPE: L, coef = mask_levels(L, coef, kbps, rate)
+        if SDROP > 0 and kbps < 24 and coef.shape[0] == 2 and not mono and not SCOPE:  # side channel far below the main one in this band: not worth bits, the band decodes as mono
+            r_ = rhat(L); drop = (L[1] > 0) & (r_[1] < r_[0] * 10 ** (-SDROP / 20)); L[1][drop] = 0; coef[1] *= ~drop[:, BMAP]
         return coef, smooth_levels(L, lam) if lam else L
     coef, L = fix(coef, L)
     target, F = kbps * 125 * n / rate, coef.shape[1]  # bytes
