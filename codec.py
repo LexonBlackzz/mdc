@@ -605,16 +605,17 @@ def encode(x, rate, step=1.0, show=False, tilt=TILT, cutoff=0):
     return pack(coef, L, side_bytes(L), tb, rate, len(x), step, tilt, 1.0 if NF is None else NF)
 
 
+MONOBELOW = 24  # kbps: below this, stereo input is coded as mono and the decoder gives both channels back
 DUP = False  # the file being coded was stereo, coded as one channel: the decoder gives both channels back
 FIXED = None  # constant-quality mode: skip the bitrate search and code with exactly this step
 
 
-def encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0, scope=False, mono=False, step=None, automono=True):  # cutoff in Hz, 0 = full band; step = constant-quality (VBR) mode, kbps then only picks the settings; automono: two identical (or, up to 96 kbps, nearly identical) channels are coded as one
+def encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0, scope=False, mono=False, step=None, automono=True):  # cutoff in Hz, 0 = full band; step = constant-quality (VBR) mode, kbps then only picks the settings; automono: below MONOBELOW kbps stereo is coded as one channel (all the bits to one channel beats half each), and two identical (or, up to 96 kbps, nearly identical) channels are coded as one; False keeps stereo
     """scope=True (oscilloscope music, anything where the left/right waveforms themselves matter): plain left/right coding, uniform noise in every band, no noise fill, no level hold."""
     global GAMMA, MS, NF, SCOPE, ENVC
     dup = False  # automatic mono: the decoder gives two channels back
     if automono and not mono and not scope and x.shape[1] == 2:
-        d, m = x[:, 0].astype(np.float64) - x[:, 1], x.astype(np.float64).mean(1); dup = mono = bool(np.abs(d).max() <= 1 or (kbps <= 96 and (d * d).sum() / 2 <= 1e-5 * (m * m).sum()))
+        d, m = x[:, 0].astype(np.float64) - x[:, 1], x.astype(np.float64).mean(1); dup = mono = bool(kbps < MONOBELOW or np.abs(d).max() <= 1 or (kbps <= 96 and (d * d).sum() / 2 <= 1e-5 * (m * m).sum()))
     if mono and x.shape[1] > 1: x = x.mean(1, keepdims=True).astype(F32)  # merged mono: all bits go to one channel
     saved = GAMMA, MS, NF, SCOPE, ENVC
     ENVC = kbps < 8 and not scope
@@ -777,11 +778,12 @@ def read_wav(p):  # any libsndfile format: wav, flac, ogg, aiff...; 24-bit is re
 
 def write_wav(p, y, rate):
     with wave.open(p, "wb") as w:
+        y = np.ascontiguousarray(y if y.dtype == np.int16 else np.clip(np.rint(y), -32768, 32767).astype(np.int16))  # always 16-bit PCM, whatever float the caller has
         w.setnchannels(y.shape[1]); w.setsampwidth(2); w.setframerate(rate); w.writeframes(y.tobytes())
 
 
 if __name__ == "__main__":
-    a = [v for v in sys.argv[1:] if v not in ("--scope", "--mono")]; scope = "--scope" in sys.argv; mono = "--mono" in sys.argv
+    a = [v for v in sys.argv[1:] if v not in ("--scope", "--mono", "--stereo")]; scope = "--scope" in sys.argv; mono = "--mono" in sys.argv; stereo = "--stereo" in sys.argv
     if a[:1] == ["enc"]:
         t0 = time.time(); x, r = read_wav(a[1]); v = a[3] if len(a) > 3 else "128k"; tl = float(a[4]) if len(a) > 4 else TILT; cut = float(a[5]) if len(a) > 5 else 0.0
         if len(a) > 6: GAMMA = float(a[6])
@@ -789,7 +791,7 @@ if __name__ == "__main__":
         if len(a) > 8: TRANS = float(a[8])
         if len(a) > 9: NFLO = float(a[9])
         if len(a) > 10: SMOOTH = bool(int(a[10]))
-        b = encode_kbps(x, r, float(v[:-1]), True, tl, cut, scope, mono) if v.endswith("k") else encode(x, r, float(v), True, tl, cut or 0)
+        b = encode_kbps(x, r, float(v[:-1]), True, tl, cut, scope, mono, automono=not stereo) if v.endswith("k") else encode(x, r, float(v), True, tl, cut or 0)
         open(a[2], "wb").write(b); print(f"{len(b) * 8 / (len(x) / r) / 1000:.2f} kbps, {time.time() - t0:.0f}s")
     elif a[:1] == ["dec"]:
         y, r = decode(open(a[1], "rb").read(), True); write_wav(a[2] if len(a) > 2 else a[1].rsplit(".", 1)[0] + ".wav", y, r)
