@@ -396,7 +396,7 @@ def pack(coef, L, side, tb, rate, n, step, tilt, nf, zmin=None, seeds=True, segf
     enc = rc.encode_mix if mix else rc.encode
     while (m := enc(q, K, out, bc, BMAP)) < 0: out = np.empty(len(out) * 2, np.uint8)
     bits = np.unpackbits(best[use].astype(np.uint8)[:, None], axis=1)[:, 8 - SB:].reshape(-1) if seeds else np.zeros(SB * int(use.sum()), np.uint8)
-    return struct.pack(HDR, rate, n, coef.shape[0], step, tilt, int(MS and coef.shape[0] == 2) | (int(ENVC) << 1) | (EDGE_CUSTOM << 2) | (int(segf is not None and bool(tb)) << 3) | (int(mix) << 4) | (int(TNS_USED and bool(tb)) << 5) | (int(DUP and bool(tb)) << 6) | (int(GLB > 0 and bool(tb)) << 7), K, gamma, nf, len(side), kap, zmin, m, tg) + tb2 + side + env + out[:m].tobytes() + np.packbits(bits).tobytes()
+    return struct.pack(HDR, rate, n, coef.shape[0], step, tilt, int(MS and coef.shape[0] == 2) | (int(ENVC) << 1) | (EDGE_CUSTOM << 2) | (int(segf is not None and bool(tb)) << 3) | (int(mix) << 4) | (int(TNS_USED and bool(tb)) << 5) | (int(DUP and bool(tb)) << 6) | (int(GLB > 0 and bool(tb)) << 7), K | (int(PE_USED and bool(tb)) << 15), gamma, nf, len(side), kap, zmin, m, tg) + tb2 + side + env + out[:m].tobytes() + np.packbits(bits).tobytes()
 
 
 def auto_cutoff(kbps):
@@ -582,6 +582,58 @@ def tns_unpack(b, o, ch, F):
     return idx, on, 4 + nfl + nn
 
 
+PEON = 0  # set by encode_kbps: send pulse envelopes for the noise-filled top end
+PE_USED = 0
+PEMAX = float(os.environ.get('PEMAX', 48))  # kbps below which pulse envelopes are considered
+PETHR = float(os.environ.get('PETHR', 0.3))  # a frame is flagged when the 2-12 kHz envelope of the original varies this much (std / mean) within it
+PEEXP = float(os.environ.get('PEEXP', 1.6))  # >1 exaggerates the transmitted envelope's depth
+PEGMIN = float(os.environ.get('PEGMIN', 0.125))  # gain limit of the pulse correction (amplitude, both ways)
+PELO, PESEG = 2000, 64  # the pulse envelope covers 2 kHz and up, in segments of PESEG samples (PENS per frame)
+PENS = N // PESEG
+
+
+def pe_bin(rate): return int(PELO / (rate / 2) * N)
+
+
+def pe_analyze(x, short, rate, F):
+    """Buzzy or gated material (a pitched synth, a stutter) pulses in the highs every few ms; noise fill is steady over a 23 ms frame and loses that. For each long frame whose 2-12 kHz envelope in the original varies strongly,
+    return the envelope: PENS values, in 3 dB steps below the frame's loudest segment."""
+    from scipy.signal import butter, sosfiltfilt
+    if len(x) < 256: return np.zeros(F, bool), np.zeros((0, PENS), np.int32)  # too short to filter
+    m = x.astype(np.float64).mean(1); h = sosfiltfilt(butter(4, [PELO, min(12000, 0.45 * rate)], "band", fs=rate, output="sos"), m)
+    Q = np.zeros(F * N + N); Q[N // 2:N // 2 + len(h)] = h * h  # frame s owns samples sN - N/2 .. sN + N/2
+    E = Q[:F * N].reshape(F, PENS, PESEG).mean(-1); a = np.sqrt(E); flags = (a.std(1) > PETHR * a.mean(1)) & (a.mean(1) > 10) & ~short
+    q = np.clip(np.round(-np.log2(E[flags] / np.maximum(E[flags].max(-1, keepdims=True), 1e-9) + 1e-12)), 0, 15).astype(np.int32)
+    return flags, q
+
+
+def pe_pack(flags, q):
+    fl = np.packbits(flags).tobytes(); a = np.ascontiguousarray(q.reshape(1, -1, 1)); out = np.empty(a.size * 2 + 4096, np.uint8)
+    while (m := rc.encode_side(a, out)) < 0: out = np.empty(len(out) * 2, np.uint8)
+    return struct.pack("<I", len(fl)) + fl + struct.pack("<I", m) + out[:m].tobytes()
+
+
+def pe_unpack(b, o, F):
+    nfl = struct.unpack_from("<I", b, o)[0]; flags = np.unpackbits(np.frombuffer(b, np.uint8, count=nfl, offset=o + 4))[:F].astype(bool)
+    m = struct.unpack_from("<I", b, o + 4 + nfl)[0]; k = int(flags.sum())
+    q = rc.decode_side(np.frombuffer(b, np.uint8, count=m, offset=o + 8 + nfl), 1, k * PENS, 1)[..., 0].reshape(-1, PENS) if k else np.zeros((0, PENS), np.int32)
+    return flags, q, 8 + nfl + m
+
+
+def pe_apply(y, flags, q, rate, F):
+    """y: (channels, (F+1)*N) decoded, before the lead-in is cut. In each flagged frame the 2 kHz+ band is regained segment by segment so its envelope follows the transmitted one (frame energy unchanged); gains are limited to
+    +-12 dB and interpolated between segment centres. Content that was already coded accurately has the right envelope, so its gain stays near 1."""
+    from scipy.signal import butter, sosfiltfilt
+    sos = butter(4, [PELO, min(12000, 0.45 * rate)], "band", fs=rate, output="sos"); tgt = 2.0 ** (-q * PEEXP)  # power
+    pos = np.arange(F)[:, None] * N + N // 2 + PESEG * (np.arange(PENS)[None, :] + 0.5); out = y.copy()
+    for c in range(len(y)):
+        hf = sosfiltfilt(sos, y[c].astype(np.float64)); E = np.zeros(F * N + N); E[:len(hf) - N // 2] = hf[N // 2:] ** 2; E = E[:F * N].reshape(F, PENS, PESEG).mean(-1)[flags]
+        want = tgt * (E.sum(1, keepdims=True) / tgt.sum(1, keepdims=True)); g = np.clip(np.sqrt(want / (E + 1e-3)), PEGMIN, 1 / PEGMIN)
+        v = np.ones((F, PENS)); v[flags] = g
+        out[c] = y[c] + (np.interp(np.arange(y.shape[1]), pos.reshape(-1), v.reshape(-1)) - 1) * hf
+    return out.astype(F32)
+
+
 def prepare(x, rate, cutoff, show=False, g=0.0):
     """g > 0: a guess of the final step, used to pick each band's stereo rotation (otherwise plain mid/side)."""
     short = detect(x); coef = analyze(x, short, show); tb = np.packbits(short).tobytes()
@@ -596,6 +648,11 @@ def prepare(x, rate, cutoff, show=False, g=0.0):
         ch, F, _ = coef.shape; idx = np.zeros((ch, F, TORD), np.int8); on = np.zeros((ch, F), bool); bs, be = tns_range(rate)
         _tns_enc(coef, short, bs, be, TNSG, TNSS, idx, on)
         if on.any(): tb += tns_pack(idx, on); TNS_USED = 1
+    global PE_USED
+    PE_USED = 0
+    if PEON and not SCOPE:
+        pf, pq = pe_analyze(x, short, rate, coef.shape[1])
+        if pf.any(): tb += pe_pack(pf, pq); PE_USED = 1
     return coef, levels(coef), tb
 
 
@@ -612,7 +669,8 @@ FIXED = None  # constant-quality mode: skip the bitrate search and code with exa
 
 def encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0, scope=False, mono=False, step=None, automono=True):  # cutoff in Hz, 0 = full band; step = constant-quality (VBR) mode, kbps then only picks the settings; automono: below MONOBELOW kbps stereo is coded as one channel (all the bits to one channel beats half each), and two identical (or, up to 96 kbps, nearly identical) channels are coded as one; False keeps stereo
     """scope=True (oscilloscope music, anything where the left/right waveforms themselves matter): plain left/right coding, uniform noise in every band, no noise fill, no level hold."""
-    global GAMMA, MS, NF, SCOPE, ENVC
+    global GAMMA, MS, NF, SCOPE, ENVC, PEON
+    PEON = int(kbps < PEMAX and not scope)
     dup = False  # automatic mono: the decoder gives two channels back
     if automono and not mono and not scope and x.shape[1] == 2:
         d, m = x[:, 0].astype(np.float64) - x[:, 1], x.astype(np.float64).mean(1); dup = mono = bool(kbps < MONOBELOW or np.abs(d).max() <= 1 or (kbps <= 96 and (d * d).sum() / 2 <= 1e-5 * (m * m).sum()))
@@ -628,10 +686,11 @@ def encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0, scope=False, mon
     global KAP, TG, FIXED, DUP
     FIXED = step; DUP = dup
     TG = TGE if 'TG' in os.environ else (0.0 if scope else float(np.interp(kbps, [24, 32], [0.9, 0.0])))  # quiet passages keep their relative accuracy at low rates
+    TG = float(F32(TG))  # the header stores TG and KAP as float32: the encoder must use exactly what the decoder will read, or a context bucket can flip and the entropy decoder loses sync
     try:
         dur = len(x) / rate; kap0 = 0 if scope or kbps < 48 else float(np.interp(np.log2(kbps), np.log2([48, 64, 128]), [2.6, 2.2, 1.8]))
         for kap in ([kap0, kap0 * 1.35, kap0 * 1.8] if kap0 else []) + [0]:  # quiet bands next to loud ones keep a minimum SNR; if that does not fit the bitrate, relax it
-            KAP = kap; b = _encode_kbps(x, rate, kbps, show, tilt, cutoff)
+            KAP = float(F32(kap)); b = _encode_kbps(x, rate, kbps, show, tilt, cutoff)
             if step or len(b) * 8 / dur / 1000 <= kbps * 1.02: break
         return b
     finally: GAMMA, MS, NF, SCOPE, ENVC = saved; KAP = 0; GLB = 0
@@ -712,7 +771,7 @@ def _encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0):
 
 def decode(b, show=False):
     global KAP, TG, GLB
-    rate, n, ch, step, tilt, ms, K, gamma, nf, sl, kap, zmin, cl, tg = struct.unpack(HDR, b[:HLEN]); mixed = (ms >> 4) & 1; tnsflag = (ms >> 5) & 1; dupflag = (ms >> 6) & 1; GLB = int(24 * N // 1024) * ((ms >> 7) & 1); envc, cust, segflag, ms = (ms >> 1) & 1, (ms >> 2) & 1, (ms >> 3) & 1, ms & 1
+    rate, n, ch, step, tilt, ms, K, gamma, nf, sl, kap, zmin, cl, tg = struct.unpack(HDR, b[:HLEN]); peflag, K = K >> 15, K & 0x7FFF; mixed = (ms >> 4) & 1; tnsflag = (ms >> 5) & 1; dupflag = (ms >> 6) & 1; GLB = int(24 * N // 1024) * ((ms >> 7) & 1); envc, cust, segflag, ms = (ms >> 1) & 1, (ms >> 2) & 1, (ms >> 3) & 1, ms & 1
     KAP, TG = kap, tg; nflo = 1.0  # header slot formerly the unused NFLO: the step cap
     F, wts = nframes(n), weights(tilt); tl = (F + 7) // 8
     short = np.unpackbits(np.frombuffer(b, np.uint8, count=tl, offset=HLEN))[:F].astype(bool); var = varof(short)
@@ -724,6 +783,8 @@ def decode(b, show=False):
     tns = None
     if tnsflag:
         tidx, ton, tn = tns_unpack(b, HLEN + tl, ch, F); tns = (tidx, ton); tl += tn
+    pe = None
+    if peflag: pf, pq, tn = pe_unpack(b, HLEN + tl, F); pe = (pf, pq); tl += tn
     L = rc.decode_side(np.frombuffer(b, np.uint8, count=sl, offset=HLEN + tl), ch, F, NBF)
     FN = frame_factor(L, gamma, segf); sel = env_sel(L, short); ns = int(sel.sum()); el, o = 0, HLEN + tl + sl
     if ns:
@@ -735,7 +796,7 @@ def decode(b, show=False):
     c0 = HLEN + tl + sl + el; q = (rc.decode_mix if mixed else rc.decode)(np.frombuffer(b, np.uint8, count=cl, offset=c0), ch, F, K, N, expected(L, step, tilt, gamma, FN), BMAP)
     use = seed_mask(q, L, short, zmin); sd = np.zeros(use.shape, np.int64)  # noise pattern index per band
     sd[use] = np.unpackbits(np.frombuffer(b, np.uint8, offset=c0 + cl))[:SB * int(use.sum())].reshape(-1, SB) @ (1 << np.arange(SB - 1, -1, -1))
-    y, FW, DEQ = np.zeros((ch, (F + 1) * N), F32), fw(rate, nflo), np.empty((ch, F, N), F32)
+    FW, DEQ = fw(rate, nflo), np.empty((ch, F, N), F32)
     for c in range(ch):
         for s in range(0, F, CHUNK):
             e = min(F, s + CHUNK); Lc, qc, sh = L[c, s:e], q[c, s:e], short[s:e]
@@ -753,19 +814,25 @@ def decode(b, show=False):
             if tns is not None: _tns_dec(deq, tns[0][c, s:e], tns[1][c, s:e], sh, *tns_range(rate))
             DEQ[c, s:e] = deq
     if ang is not None: DEQ = rot(DEQ, ang, True)  # back from the rotated stereo pair to left/right
-    for c in range(ch):
-        for s in range(0, F, CHUNK):
-            e = min(F, s + CHUNK); deq, sh = DEQ[c, s:e], short[s:e]
-            fr = np.empty((e - s, 2 * N), F32)
-            if (~sh).any(): fr[~sh] = (deq[~sh] @ BASIS) * LONGW[var[s:e][~sh]]
-            if sh.any():
-                bl = (deq[sh].reshape(-1, M, NS).transpose(0, 2, 1) @ BASIS_S) * WS  # (k, NS, 2M)
-                buf = np.zeros((len(bl), 2 * N), F32)
-                for j in range(NS): buf[:, OFF + M * j:OFF + M * j + 2 * M] += bl[:, j]
-                fr[sh] = buf
-            y[c, s * N:e * N] += fr[:, :N].reshape(-1)  # TDAC overlap-add: 2nd half of frame i + 1st half of frame i+1
-            y[c, (s + 1) * N:(e + 1) * N] += fr[:, N:].reshape(-1)
-            if show: bar(c * F + e, ch * F, "decode")
+
+    def synth(D):
+        yy = np.zeros((ch, (F + 1) * N), F32)
+        for c in range(ch):
+            for s in range(0, F, CHUNK):
+                e = min(F, s + CHUNK); deq, sh = D[c, s:e], short[s:e]
+                fr = np.empty((e - s, 2 * N), F32)
+                if (~sh).any(): fr[~sh] = (deq[~sh] @ BASIS) * LONGW[var[s:e][~sh]]
+                if sh.any():
+                    bl = (deq[sh].reshape(-1, M, NS).transpose(0, 2, 1) @ BASIS_S) * WS  # (k, NS, 2M)
+                    buf = np.zeros((len(bl), 2 * N), F32)
+                    for j in range(NS): buf[:, OFF + M * j:OFF + M * j + 2 * M] += bl[:, j]
+                    fr[sh] = buf
+                yy[c, s * N:e * N] += fr[:, :N].reshape(-1)  # TDAC overlap-add: 2nd half of frame i + 1st half of frame i+1
+                yy[c, (s + 1) * N:(e + 1) * N] += fr[:, N:].reshape(-1)
+                if show: bar(c * F + e, ch * F, "decode")
+        return yy
+    y = synth(DEQ)
+    if pe is not None: y = pe_apply(y, *pe, rate, F)
     out = np.clip(y.T[N:N + n], -32768, 32767).astype(np.int16)
     return np.ascontiguousarray(np.repeat(out, 2, axis=1) if dupflag and out.shape[1] == 1 else out), rate  # dupflag: the input was stereo with (nearly) identical channels, coded as one
 
