@@ -21,8 +21,15 @@ GAMMA = 0.3  # step ~ (band level)^GAMMA: 0 = same noise everywhere, 1 = same SN
 NF = None  # noise fill strength for bins that rounded to zero (0 = off). None = automatic from the bitrate: 0.8 at 1 kbps, 0.7 from 3 kbps up (spectrum error is lowest there at every rate tested)
 
 
+BRIGHT = (12, 48)  # kbps range of the bright-top settings. There most of the top end is noise fill, so its loudness IS the signal: the fill runs at full strength and is not smoothed over time, and the bands above HFRAW follow the true level every frame (smoothing them flattened hi-hats and left the top end 2-7 dB quiet)
+HFRAW = 4000  # Hz
+
+
+def bright(kbps): return BRIGHT[0] <= kbps < BRIGHT[1]
+
+
 def auto_nf(kbps):  # lots of holes at low bitrates, where the noise adds fidelity; at high bitrates it is mostly just extra noise
-    return float(np.interp(kbps, [1, 3], [0.8, 0.7]))
+    return 1.0 if bright(kbps) else float(np.interp(kbps, [1, 3], [0.8, 0.7]))
 TRANS = 8.0  # a 128-sample segment this many times louder (after a high-pass) than the average of the 8 before it makes its frame short; 0 = never
 ENVC = False  # set by encode_kbps: noise envelopes in 6 dB steps instead of 3 dB
 SCOPE = False  # set by encode_kbps(scope=True)
@@ -287,7 +294,7 @@ def _fold(deq, q, sh, edges, sgn, out, has):
 
 SDROP = float(os.environ.get('SDROP', 10))  # dB: below 24 kbps the side channel is dropped in bands where it is this far below the main channel (its sparse pulses make the stereo image flicker and cost bits the voice needs); 0 = never
 SNF = float(os.environ.get('SNF', 0.7))  # noise fill strength of the second (side) channel relative to the first
-NFSM = float(os.environ.get('NFSM', 0.5))
+NFSM0 = float(os.environ.get('NFSM', 0.5)); NFSM = NFSM0  # how much the noise fill level is smoothed over time; encode_kbps sets 0 in the bright range (header: K bit 14)
 NFIF = int(os.environ.get('NFIF', 1))
 _IW = None
 
@@ -396,7 +403,7 @@ def pack(coef, L, side, tb, rate, n, step, tilt, nf, zmin=None, seeds=True, segf
     enc = rc.encode_mix if mix else rc.encode
     while (m := enc(q, K, out, bc, BMAP)) < 0: out = np.empty(len(out) * 2, np.uint8)
     bits = np.unpackbits(best[use].astype(np.uint8)[:, None], axis=1)[:, 8 - SB:].reshape(-1) if seeds else np.zeros(SB * int(use.sum()), np.uint8)
-    return struct.pack(HDR, rate, n, coef.shape[0], step, tilt, int(MS and coef.shape[0] == 2) | (int(ENVC) << 1) | (EDGE_CUSTOM << 2) | (int(segf is not None and bool(tb)) << 3) | (int(mix) << 4) | (int(TNS_USED and bool(tb)) << 5) | (int(DUP and bool(tb)) << 6) | (int(GLB > 0 and bool(tb)) << 7), K | (int(PE_USED and bool(tb)) << 15), gamma, nf, len(side), kap, zmin, m, tg) + tb2 + side + env + out[:m].tobytes() + np.packbits(bits).tobytes()
+    return struct.pack(HDR, rate, n, coef.shape[0], step, tilt, int(MS and coef.shape[0] == 2) | (int(ENVC) << 1) | (EDGE_CUSTOM << 2) | (int(segf is not None and bool(tb)) << 3) | (int(mix) << 4) | (int(TNS_USED and bool(tb)) << 5) | (int(DUP and bool(tb)) << 6) | (int(GLB > 0 and bool(tb)) << 7), K | (int(PE_USED and bool(tb)) << 15) | (int(NFSM == 0) << 14), gamma, nf, len(side), kap, zmin, m, tg) + tb2 + side + env + out[:m].tobytes() + np.packbits(bits).tobytes()
 
 
 def auto_cutoff(kbps):
@@ -669,7 +676,8 @@ FIXED = None  # constant-quality mode: skip the bitrate search and code with exa
 
 def encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0, scope=False, mono=False, step=None, automono=True):  # cutoff in Hz, 0 = full band; step = constant-quality (VBR) mode, kbps then only picks the settings; automono: below MONOBELOW kbps stereo is coded as one channel (all the bits to one channel beats half each), and two identical (or, up to 96 kbps, nearly identical) channels are coded as one; False keeps stereo
     """scope=True (oscilloscope music, anything where the left/right waveforms themselves matter): plain left/right coding, uniform noise in every band, no noise fill, no level hold."""
-    global GAMMA, MS, NF, SCOPE, ENVC, PEON
+    global GAMMA, MS, NF, SCOPE, ENVC, PEON, NFSM
+    NFSM = 0.0 if bright(kbps) and not scope else NFSM0
     PEON = int(kbps < PEMAX and not scope)
     dup = False  # automatic mono: the decoder gives two channels back
     if automono and not mono and not scope and x.shape[1] == 2:
@@ -693,11 +701,16 @@ def encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0, scope=False, mon
             KAP = float(F32(kap)); b = _encode_kbps(x, rate, kbps, show, tilt, cutoff)
             if step or len(b) * 8 / dur / 1000 <= kbps * 1.02: break
         return b
-    finally: GAMMA, MS, NF, SCOPE, ENVC = saved; KAP = 0; GLB = 0
+    finally: GAMMA, MS, NF, SCOPE, ENVC = saved; KAP = 0; GLB = 0; NFSM = NFSM0
 
 
 GLO = float(os.environ.get('GLO', 0.45))  # gamma at 16 kbps and below
 SEGB = float(os.environ.get('SEGB', 0.3))  # 0 = constant step over the song (quiet/simple passages get few bits); 1 = every segment gets the same number of bits (like a constant-bitrate codec)
+SEGMID = 0.7  # ... and the share used at 32 kbps (ramping back to SEGB at 24 and at 64). There the step no longer follows loudness (TG is off) and a quiet tonal intro was left with audible noise between its notes; by ear 0.7 is clearly better at 32 kbps and slightly smearier at 64
+
+
+def seg_share(kbps):
+    return SEGB if 'SEGB' in os.environ or SEGB <= 0 else float(np.interp(np.log2(kbps), np.log2([24, 32, 64]), [SEGB, SEGMID, SEGB]))
 
 
 def choose_seg(coef, L, g, gamma, tilt, beta=None):
@@ -729,7 +742,10 @@ def _encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0):
         if not SCOPE: L, coef = mask_levels(L, coef, kbps, rate)
         if SDROP > 0 and kbps < 24 and coef.shape[0] == 2 and not mono and not SCOPE:  # side channel far below the main one in this band: not worth bits, the band decodes as mono
             r_ = rhat(L); drop = (L[1] > 0) & (r_[1] < r_[0] * 10 ** (-SDROP / 20)); L[1][drop] = 0; coef[1] *= ~drop[:, BMAP]
-        return coef, smooth_levels(L, lam) if lam else L
+        if not lam: return coef, L
+        Ls = smooth_levels(L, lam)
+        if bright(kbps): hf = CEN * rate / 2 / N >= HFRAW; Ls[..., hf] = L[..., hf]  # the top bands keep their true level in every frame (~0.3 kbps)
+        return coef, Ls
     coef, L = fix(coef, L)
     target, F = kbps * 125 * n / rate, coef.shape[1]  # bytes
     sel = np.concatenate([np.arange(b, min(F, b + 16)) for b in range(0, F, 320)]) if F > 640 else np.arange(F)  # 16-frame blocks spread over the song
@@ -746,7 +762,7 @@ def _encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0):
     near = np.array(sp[-5:]); slope0 = float(np.clip(np.polyfit(near[:, 0], near[:, 1], 1)[0], -3, -0.3)) if len(sp) and np.ptp(near[:, 0]) > 1e-9 else -0.8
     if MS and x.shape[1] == 2 and not mono:  # now that the step is roughly known: choose each band's stereo rotation and redo the transform
         coef, L, tb = prepare(x, rate, cutoff, False, float(np.exp(hi))); coef, L = fix(coef, L)
-    segf = choose_seg(coef, L, float(np.exp(hi)), float(F32(GAMMA)), tilt) if SEGB > 0 and kbps >= 6 and not SCOPE else None
+    segf = choose_seg(coef, L, float(np.exp(hi)), float(F32(GAMMA)), tilt, seg_share(kbps)) if SEGB > 0 and kbps >= 6 and not SCOPE else None
     if FIXED: return pack(coef, L, side_bytes(L), tb, rate, n, FIXED, tilt, nf, zm, True, segf, bool(MIXC))
     side, P, best, smallest, pts, ls = side_bytes(L), 7, None, None, [], hi  # the sample is only an estimate: refine on the whole song
     rm = 0.97 if MIXC else 1.0  # size of the mixed-coder file relative to the plain coder's: searched with the plain (fast) coder, then corrected from the real final size
@@ -770,8 +786,8 @@ def _encode_kbps(x, rate, kbps, show=False, tilt=TILT, cutoff=0):
 
 
 def decode(b, show=False):
-    global KAP, TG, GLB
-    rate, n, ch, step, tilt, ms, K, gamma, nf, sl, kap, zmin, cl, tg = struct.unpack(HDR, b[:HLEN]); peflag, K = K >> 15, K & 0x7FFF; mixed = (ms >> 4) & 1; tnsflag = (ms >> 5) & 1; dupflag = (ms >> 6) & 1; GLB = int(24 * N // 1024) * ((ms >> 7) & 1); envc, cust, segflag, ms = (ms >> 1) & 1, (ms >> 2) & 1, (ms >> 3) & 1, ms & 1
+    global KAP, TG, GLB, NFSM
+    rate, n, ch, step, tilt, ms, K, gamma, nf, sl, kap, zmin, cl, tg = struct.unpack(HDR, b[:HLEN]); peflag, NFSM, K = K >> 15, (0.0 if (K >> 14) & 1 else NFSM0), K & 0x3FFF; mixed = (ms >> 4) & 1; tnsflag = (ms >> 5) & 1; dupflag = (ms >> 6) & 1; GLB = int(24 * N // 1024) * ((ms >> 7) & 1); envc, cust, segflag, ms = (ms >> 1) & 1, (ms >> 2) & 1, (ms >> 3) & 1, ms & 1
     KAP, TG = kap, tg; nflo = 1.0  # header slot formerly the unused NFLO: the step cap
     F, wts = nframes(n), weights(tilt); tl = (F + 7) // 8
     short = np.unpackbits(np.frombuffer(b, np.uint8, count=tl, offset=HLEN))[:F].astype(bool); var = varof(short)
